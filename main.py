@@ -1,80 +1,107 @@
 import asyncio
+import logging
 import aiosqlite
 import aiohttp
-import logging
-from aiogram import Bot, Dispatcher, types
+import os
+from dotenv import load_dotenv
+from aiogram import Bot, Dispatcher
 from aiogram.filters import Command
+from aiogram.types import Message
 
-# Твой токен от BotFather
-TOKEN = "8629717626:AAHx0iZ1Vc5PJltcFEafMo0XTfRD80ozlhA"
-# Твой ID, который прислал @userinfobot
-MY_ID = "7873130977" 
+# Загружаем переменные из .env
+load_dotenv()
+TOKEN = os.getenv("TOKEN")
 
+# Настройка логирования
 logging.basicConfig(level=logging.INFO)
-
 bot = Bot(token=TOKEN)
 dp = Dispatcher()
 
+# Инициализация БД
 async def init_db():
     async with aiosqlite.connect("sites.db") as db:
-        await db.execute("CREATE TABLE IF NOT EXISTS sites (url TEXT)")
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS sites (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER,
+                url TEXT
+            )
+        """)
         await db.commit()
 
-# Функция, которая будет проверять сайты в фоне
-async def monitor_sites():
-    while True:
-        async with aiosqlite.connect("sites.db") as db:
-            async with db.execute("SELECT url FROM sites") as cursor:
-                sites = await cursor.fetchall()
-        
-        if sites:
-            async with aiohttp.ClientSession() as session:
-                for site in sites:
-                    url = site[0]
-                    try:
-                        async with session.get(url, timeout=10) as response:
-                            if response.status != 200:
-                                await bot.send_message(MY_ID, f"⚠️ Сайт {url} вернул статус {response.status}")
-                    except Exception as e:
-                        await bot.send_message(MY_ID, f"❌ Сайт {url} недоступен! Ошибка: {str(e)[:50]}")
-        
-        # Проверка каждые 60 секунд
-        await asyncio.sleep(60)
-
+# Команда /start
 @dp.message(Command("start"))
-async def cmd_start(message: types.Message):
-    await message.answer("Бот мониторинга активен! Используй /add <ссылка> для добавления сайтов.")
+async def start(message: Message):
+    await message.answer("Привет! Я бот для мониторинга сайтов. Используй /add <ссылка>, /list и /delete <ссылка>.")
 
+# Добавление сайта
 @dp.message(Command("add"))
-async def add_site(message: types.Message):
+async def add_site(message: Message):
     args = message.text.split(maxsplit=1)
     if len(args) < 2:
         await message.answer("Укажи ссылку. Пример: /add https://google.com")
         return
     
     url = args[1]
+    user_id = message.from_user.id
+    
     async with aiosqlite.connect("sites.db") as db:
-        await db.execute("INSERT INTO sites (url) VALUES (?)", (url,))
+        await db.execute("INSERT INTO sites (user_id, url) VALUES (?, ?)", (user_id, url))
         await db.commit()
-    await message.answer(f"✅ Сайт {url} добавлен в мониторинг.")
+    await message.answer(f"✅ Сайт {url} успешно добавлен.")
 
+# Список сайтов пользователя
 @dp.message(Command("list"))
-async def list_sites(message: types.Message):
+async def list_sites(message: Message):
+    user_id = message.from_user.id
     async with aiosqlite.connect("sites.db") as db:
-        async with db.execute("SELECT url FROM sites") as cursor:
+        async with db.execute("SELECT url FROM sites WHERE user_id = ?", (user_id,)) as cursor:
             sites = await cursor.fetchall()
-            text = "🌐 Мониторинг:\n" + "\n".join([s[0] for s in sites]) if sites else "Список пуст."
+            if sites:
+                text = "🌐 Твои сайты:\n" + "\n".join([s[0] for s in sites])
+            else:
+                text = "У тебя пока нет добавленных сайтов."
             await message.answer(text)
 
+# Удаление сайта
+@dp.message(Command("delete"))
+async def delete_site(message: Message):
+    args = message.text.split(maxsplit=1)
+    if len(args) < 2:
+        await message.answer("Укажи ссылку для удаления. Пример: /delete https://google.com")
+        return
+    
+    url = args[1]
+    user_id = message.from_user.id
+    
+    async with aiosqlite.connect("sites.db") as db:
+        await db.execute("DELETE FROM sites WHERE user_id = ? AND url = ?", (user_id, url))
+        await db.commit()
+    await message.answer(f"🗑 Сайт {url} удален.")
+
+# Фоновый мониторинг
+async def monitor_sites():
+    while True:
+        async with aiosqlite.connect("sites.db") as db:
+            async with db.execute("SELECT user_id, url FROM sites") as cursor:
+                sites = await cursor.fetchall()
+        
+        async with aiohttp.ClientSession() as session:
+            for user_id, url in sites:
+                try:
+                    async with session.get(url, timeout=10) as response:
+                        if response.status != 200:
+                            await bot.send_message(user_id, f"⚠️ Сайт {url} вернул статус {response.status}")
+                except Exception as e:
+                    await bot.send_message(user_id, f"❌ Сайт {url} недоступен! Ошибка: {str(e)[:30]}")
+        
+        await asyncio.sleep(60) # Проверка каждую минуту
+
+# Основной запуск
 async def main():
     await init_db()
-    # Запускаем мониторинг как фоновую задачу
     asyncio.create_task(monitor_sites())
-    print("Бот и монитор успешно запущены...")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        print("\nБот остановлен.")
+    asyncio.run(main())
